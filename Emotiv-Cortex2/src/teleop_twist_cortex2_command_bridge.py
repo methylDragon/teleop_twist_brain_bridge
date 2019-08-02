@@ -55,7 +55,7 @@ except:
 if config.get('emotiv_credentials') is not None:
     client_id = config.get('emotiv_credentials').get('client_id')
     client_secret = config.get('emotiv_credentials').get('client_secret')
-    cortex_url = config.get('emotiv_credentials').get('client_secret', "wss://localhost:6868")
+    cortex_url = config.get('emotiv_credentials').get('cortex_url', "wss://localhost:6868")
     profile = config.get('emotiv_credentials').get('profile')
 
 if config.get('rosbridge_config') is not None:
@@ -64,7 +64,6 @@ if config.get('rosbridge_config') is not None:
 if config.get('teleop_config') is not None:
     command_min_threshold = config.get('teleop_config').get('command_min_threshold', 0.2)
     command_time_threshold = config.get('teleop_config').get('command_time_threshold', 0.5)
-    neutral_command_override_threshold = config.get('teleop_config').get('neutral_command_override_threshold', 0.5)
     data_deque_size = int(config.get('teleop_config').get('data_deque_size', 10))
     published_topic = config.get('teleop_config').get('published_topic', "/cmd_vel")
     max_lin_vel = config.get('teleop_config').get('max_lin_vel', 1.0)
@@ -127,10 +126,12 @@ cmd_vel_pub = roslibpy.Topic(rosbridge_client, published_topic, 'geometry_msgs/T
 # FUNCTIONS
 ################################################################################
 
+
 def construct_cmd_vel_msg(vel_x, vel_y, vel_z, ang_x, ang_y, ang_z):
     '''Construct a cmd_vel message.'''
-    return roslibpy.Message({'linear':{'x': vel_x, 'y': vel_y, 'z': vel_z},
-                             'angular':{'x': ang_x, 'y': ang_y, 'z': ang_z}})
+    return roslibpy.Message({'linear': {'x': vel_x, 'y': vel_y, 'z': vel_z},
+                             'angular': {'x': ang_x, 'y': ang_y, 'z': ang_z}})
+
 
 def clamp_value(value, clamp):
     '''Force value magnitude to 0 if smaller than clamp.'''
@@ -139,91 +140,192 @@ def clamp_value(value, clamp):
     else:
         return value
 
+
 def remap(value, orig_low, orig_high, remapped_low, remapped_high):
     '''Remap value from original scale to new scale.'''
     return (remapped_low
             + (value - orig_low)
             * (remapped_high - remapped_low) / (orig_high - orig_low))
 
+
+def free_rosbridge_pipe():
+    print("Freeing rosbridge websocket pipe...")
+
+    for i in range(100):
+        cmd_vel_pub.publish(construct_cmd_vel_msg(0, 0, 0, 0, 0, 0))
+        time.sleep(1 / publish_rate)
+
+    print("Done!")
+
+
+def reset_command_values():
+    global command_values
+
+    command_values = {"neutral": 0,
+                      "push": 0,
+                      "pull": 0,
+                      "lift": 0,
+                      "drop": 0,
+                      "left": 0,
+                      "right": 0,
+                      "rotateLeft": 0,
+                      "rotateRight": 0,
+                      "rotateClockwise": 0,
+                      "rotateCounterClockwise": 0,
+                      "rotateForwards": 0,
+                      "rotateReverse": 0,
+                      "disappear": 0}
+
+
+def clear_terminal():
+    print("                                                         ", end="\r")
+
+
 ################################################################################
 # CORE LOOP
 ################################################################################
 
 # Initialise command values
-command_values = {"neutral": 0,
-                  "push": 0,
-                  "pull": 0,
-                  "lift": 0,
-                  "drop": 0,
-                  "left": 0,
-                  "right": 0,
-                  "rotateLeft": 0,
-                  "rotateRight": 0,
-                  "rotateClockwise": 0,
-                  "rotateCounterClockwise": 0,
-                  "rotateForwards": 0,
-                  "rotateReverse": 0,
-                  "disappear": 0}
+reset_command_values()
+
+free_rosbridge_pipe()
+
+# FOR TESTING ROSBRIDGE
+# count = 0
+# while True:
+#     print(construct_cmd_vel_msg(0, 0, 0, 0, 0, 1))
+#     cmd_vel_pub.publish(construct_cmd_vel_msg(0, 0, 0, 0, 0, 1))
+#     count += 1
+#
+#     time.sleep(1 / publish_rate)
+#
+#     if count % 100 == 0:
+#         print("SLEEPING")
+#         time.sleep(3)
+
+
+# JUST TESTING VALUES!
+# Example data: {'data': ['neutral', 0], 'time': 1563813942.5958}
+# Example data: {'data': ['drop', 0 to 1], 'time': 1563813942.5958}
+# while True:
+#     try:
+#         latest_data = list(cortex_client.data_streams.values())[0]['com'].popleft()
+#         print(str(latest_data) + "                                  ", end="\r")
+#     except:
+#         pass
+#
+#     time.sleep(1 / publish_rate)
 
 while rosbridge_client.is_connected:
+    time.sleep(1 / publish_rate)
+    clear_terminal()
+
     try:
         # Pop off the front of the stream
         latest_data = list(cortex_client.data_streams.values())[0]['com'].popleft()
-        command_name = latest_data['data']['com'][0]
-        command_value = latest_data['data']['com'][1]
+        command_name = latest_data['data'][0]
+        command_value = latest_data['data'][1]
 
-        # Apply Exponential Moving Average for the command here
-        command_values[command_name] = (incoming_weight * command_value
-                                        + command_values[command_name] * average_weight)
+        print(str(command_name) + ": " + str(command_value), end="\r")
 
-        # Stop if neutral is high
-        if command_values.get('neutral', 0) > neutral_command_override_threshold:
+        if command_name == "neutral" or command_name == "disappear":
+            reset_command_values()
             cmd_vel_pub.publish(construct_cmd_vel_msg(0, 0, 0, 0, 0, 0))
             last_command_time = time.time()
             continue
+        else:
+            command_values[command_name] = command_value
 
-        # Otherwise calculate cmd_vel commands
+            if command_name in ["push", "lift", "rotateForwards"]:
+                lin_bias = clamp_value(command_value, command_min_threshold)
+                command = remap(lin_bias, command_min_threshold, 1, 0, max_lin_vel)
 
-        # Clamped Forward - Clamped Reverse
-        lin_bias = (clamp_value(max(
-                                command_values.get('push', 0),
-                                command_values.get('lift', 0),
-                                command_values.get('rotateForwards', 0)
-                                )
-                            , command_min_threshold)
-                - clamp_value(max(
-                                command_values.get('pull', 0),
-                                command_values.get('drop', 0),
-                                command_values.get('rotateReverse', 0)
-                                )
-                            , command_min_threshold)
-                    )
+                cmd_vel_pub.publish(construct_cmd_vel_msg(command, 0, 0, 0, 0, 0))
 
-        # Clamped Left - Clamped Right
-        ang_bias = (clamp_value(max(
-                                command_values.get('left', 0),
-                                command_values.get('rotateLeft', 0),
-                                command_values.get('rotateCounterClockwise', 0)
-                                )
-                                , command_min_threshold)
-                    - clamp_value(max(
-                                command_values.get('right', 0),
-                                command_values.get('rotateRight', 0),
-                                command_values.get('rotateClockwise', 0)
-                                )
-                                , command_min_threshold)
-                    )
+            if command_name in ["pull", "drop", "rotateReverse"]:
+                lin_bias = clamp_value(command_value, command_min_threshold)
+                command = remap(lin_bias, command_min_threshold, 1, 0, max_lin_vel)
 
-        lin_x = remap(lin_bias, command_min_threshold, 1, 0, max_lin_vel)
-        ang_z = remap(ang_bias, command_min_threshold, 1, 0, max_ang_vel)
+                cmd_vel_pub.publish(construct_cmd_vel_msg(command, 0, 0, 0, 0, 0))
 
-        cmd_vel_pub.publish(construct_cmd_vel_msg(lin_x, 0, 0, 0, 0, ang_z))
+            if command_name in ["left", "rotateLeft", "rotateCounterClockwise"]:
+                ang_bias = clamp_value(command_value, command_min_threshold)
+                command = remap(ang_bias, command_min_threshold, 1, 0, max_ang_vel)
+
+                cmd_vel_pub.publish(construct_cmd_vel_msg(0, 0, 0, 0, 0, command))
+
+            if command_name in ["right", "rotateRight", "rotateClockwise"]:
+                ang_bias = clamp_value(command_value, command_min_threshold)
+                command = remap(ang_bias, command_min_threshold, 1, 0, max_ang_vel)
+
+                cmd_vel_pub.publish(construct_cmd_vel_msg(0, 0, 0, 0, 0, -command))
+
+        #
+        # # Clamped Forward - Clamped Reverse
+        # lin_bias = (clamp_value(max(
+        #                             command_values.get('push', 0),
+        #                             command_values.get('lift', 0),
+        #                             command_values.get('rotateForwards', 0)
+        #                         ), command_min_threshold)
+        #             - clamp_value(max(
+        #                             command_values.get('pull', 0),
+        #                             command_values.get('drop', 0),
+        #                             command_values.get('rotateReverse', 0)
+        #                         ), command_min_threshold)
+        #             )
+        #
+        # # Clamped Left - Clamped Right
+        # ang_bias = (clamp_value(max(
+        #                             command_values.get('left', 0),
+        #                             command_values.get('rotateLeft', 0),
+        #                             command_values.get('rotateCounterClockwise', 0)
+        #                         ), command_min_threshold)
+        #             - clamp_value(max(
+        #                             command_values.get('right', 0),
+        #                             command_values.get('rotateRight', 0),
+        #                             command_values.get('rotateClockwise', 0)
+        #                         ), command_min_threshold)
+        #             )
+        #     # Apply Exponential Moving Average for the command here
+        #     command_values[command_name] = (incoming_weight * command_value
+        #                                     + command_values[command_name] * average_weight)
+        #
+        # # Clamped Forward - Clamped Reverse
+        # lin_bias = (clamp_value(max(
+        #                             command_values.get('push', 0),
+        #                             command_values.get('lift', 0),
+        #                             command_values.get('rotateForwards', 0)
+        #                         ), command_min_threshold)
+        #             - clamp_value(max(
+        #                             command_values.get('pull', 0),
+        #                             command_values.get('drop', 0),
+        #                             command_values.get('rotateReverse', 0)
+        #                         ), command_min_threshold)
+        #             )
+        #
+        # # Clamped Left - Clamped Right
+        # ang_bias = (clamp_value(max(
+        #                             command_values.get('left', 0),
+        #                             command_values.get('rotateLeft', 0),
+        #                             command_values.get('rotateCounterClockwise', 0)
+        #                         ), command_min_threshold)
+        #             - clamp_value(max(
+        #                             command_values.get('right', 0),
+        #                             command_values.get('rotateRight', 0),
+        #                             command_values.get('rotateClockwise', 0)
+        #                         ), command_min_threshold)
+        #             )
+        #
+        # lin_x = remap(lin_bias, command_min_threshold, 1, 0, max_lin_vel)
+        # ang_z = remap(ang_bias, command_min_threshold, 1, 0, max_ang_vel)
+        #
+        # cmd_vel_pub.publish(construct_cmd_vel_msg(lin_x, 0, 0, 0, 0, ang_z))
         last_command_time = time.time()
-        time.sleep(1 / publish_rate)
     except:
         # If no recent command has been sent, send a stop command
         if (time.time() - last_command_time) > command_time_threshold:
-            print("No recent commands! Publishing stop command!")
+            clear_terminal()
+            # print("No recent commands! Publishing stop command!", end="\r")
             cmd_vel_pub.publish(construct_cmd_vel_msg(0, 0, 0, 0, 0, 0))
 
 # Cleanup on exit
